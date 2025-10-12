@@ -1,0 +1,30 @@
+# Environnement virtuel
+venv/
+.env
+
+# Fichiers temporaires
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Dossiers de configuration IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Fichiers de build et cache
+build/
+dist/
+*.egg-info/
+*.spec
+
+# Données de test
+*.sqlite3
+*.db
+*.h5
+
+# Dossiers système
+.DS_Store
+Thumbs.db
