@@ -1,12 +1,26 @@
-from pathlib import Path
 import torch
-from safetensors.torch import load_file
 
-# Chemin exact du fichier safetensors
-MODEL_FILE = Path(r"C:\Users\Admin\.cache\huggingface\hub\models--naver--DUSt3R_ViTLarge_BaseDecoder_512_dpt\snapshots\61c57447d7b0adc8a1a30b2b0adec7a8935aa2a3\model.safetensors")
+print("==== Vérification PyTorch + CUDA ====")
 
-# Charger les poids en tant que dictionnaire
-state_dict = load_file(str(MODEL_FILE))
-print("✅ Poids chargés")
-print("Exemple d'une clé :", list(state_dict.keys())[:5])
-print("Exemple de tensor :", state_dict[list(state_dict.keys())[0]].shape)
+# Version PyTorch
+print(f"Version PyTorch installée : {torch.__version__}")
+
+# Vérifier si GPU disponible
+gpu_available = torch.cuda.is_available()
+print(f"GPU disponible : {gpu_available}")
+
+if gpu_available:
+    print(f"Nom GPU : {torch.cuda.get_device_name(0)}")
+    print(f"Nombre de GPUs : {torch.cuda.device_count()}")
+    print(f"Version CUDA compilée dans PyTorch : {torch.version.cuda}")
+    print(f"Version cuDNN : {torch.backends.cudnn.version()}")
+else:
+    print("CUDA non disponible. Vérifie ton driver GPU et l’installation CUDA.")
+
+# Test rapide tensor sur GPU
+if gpu_available:
+    try:
+        x = torch.randn(3, 3).cuda()
+        print("Test tensor sur GPU : OK")
+    except Exception as e:
+        print(f"Erreur lors du test tensor GPU : {e}")
