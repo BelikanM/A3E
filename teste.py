@@ -1,26 +1,47 @@
+import sys
+from pathlib import Path
 import torch
 
-print("==== Vérification PyTorch + CUDA ====")
+# Chemin vers ton modèle
+MODEL_PATH = Path(r"C:\Users\Admin\.cache\huggingface\hub\models--dylanebert--LGM-full\snapshots\d8db5110f68eebab2dfb7687691babd146a933cd")
 
-# Version PyTorch
-print(f"Version PyTorch installée : {torch.__version__}")
+# Ajouter le chemin aux modules personnalisés
+sys.path.append(str(MODEL_PATH))
 
-# Vérifier si GPU disponible
-gpu_available = torch.cuda.is_available()
-print(f"GPU disponible : {gpu_available}")
+# Importer les classes du modèle
+try:
+    from lgm.lgm import LGMModel
+    from image_encoder.model import ImageEncoder
+except ImportError as e:
+    print("Erreur d'importation. Vérifie les chemins et les fichiers du modèle.")
+    raise e
 
-if gpu_available:
-    print(f"Nom GPU : {torch.cuda.get_device_name(0)}")
-    print(f"Nombre de GPUs : {torch.cuda.device_count()}")
-    print(f"Version CUDA compilée dans PyTorch : {torch.version.cuda}")
-    print(f"Version cuDNN : {torch.backends.cudnn.version()}")
-else:
-    print("CUDA non disponible. Vérifie ton driver GPU et l’installation CUDA.")
+# Vérifier si CUDA est disponible
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device : {device}")
 
-# Test rapide tensor sur GPU
-if gpu_available:
-    try:
-        x = torch.randn(3, 3).cuda()
-        print("Test tensor sur GPU : OK")
-    except Exception as e:
-        print(f"Erreur lors du test tensor GPU : {e}")
+# Charger l'Image Encoder
+image_encoder_path = MODEL_PATH / "image_encoder" / "model.safetensors"
+image_encoder = ImageEncoder()
+state_dict = torch.load(image_encoder_path, map_location=device)
+image_encoder.load_state_dict(state_dict)
+image_encoder.to(device)
+image_encoder.eval()
+print("Image Encoder chargé avec succès !")
+
+# Charger le modèle LGM
+lgm_model_path = MODEL_PATH / "lgm" / "diffusion_pytorch_model.safetensors"
+lgm_model = LGMModel()
+state_dict_lgm = torch.load(lgm_model_path, map_location=device)
+lgm_model.load_state_dict(state_dict_lgm)
+lgm_model.to(device)
+lgm_model.eval()
+print("Modèle LGM chargé avec succès !")
+
+# Test rapide : passage d'un tenseur dummy
+dummy_image = torch.randn(1, 3, 256, 256).to(device)  # exemple image RGB 256x256
+with torch.no_grad():
+    features = image_encoder(dummy_image)
+    output = lgm_model(features)
+
+print("Test effectué avec succès. Shape output :", output.shape)

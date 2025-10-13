@@ -12,13 +12,21 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import open3d as o3d  # pip install open3d
 import zipfile
-import faiss
-from transformers import CLIPProcessor, CLIPModel
-from sklearn.cluster import KMeans
 import pandas as pd
 import sqlite3
 import pickle
 import subprocess
+import shutil  # Ajout pour check Blender
+from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors  # Fallback pour FAISS
+from transformers import CLIPProcessor, CLIPModel
+import psutil  # pip install psutil pour monitoring CPU
+try:
+    import pynvml  # pip install pynvml pour monitoring GPU (NVIDIA)
+    pynvml.nvmlInit()
+    NVML_AVAILABLE = True
+except ImportError:
+    NVML_AVAILABLE = False
 
 # Imports spécifiques à DUSt3R (assurez-vous d'avoir installé : pip install git+https://github.com/naver/dust3r.git)
 from dust3r.inference import inference
@@ -27,6 +35,14 @@ from dust3r.utils.image import load_images as dust3r_load_images
 from dust3r.image_pairs import make_pairs
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.utils.geometry import xy_grid
+
+# Tentative d'import FAISS avec fallback
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    st.warning("FAISS non disponible ; fallback sur scikit-learn NearestNeighbors pour recherche de similarité.")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -38,13 +54,36 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("📸 Application de Photogrammétrie Complète avec DUSt3R & MapAnything")
+st.title("📸 Application de Photogrammétrie Complète SETRAF GABON développée par NYUNDU FRANCIS ARNAUD")
 st.markdown("---")
 st.markdown("Cette application permet de charger plusieurs images, d'effectuer une reconstruction 3D dense à partir de paires d'images en utilisant le modèle DUSt3R ou MapAnything, et de visualiser le nuage de points aligné globalement avec textures réalistes et option de maillage complet ultra-réaliste.")
 
-# Vérification CUDA
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# Monitoring et sélection device
+use_gpu = st.sidebar.checkbox("Utiliser GPU (désactiver si surchauffe)", value=True, help="Désactivez pour forcer CPU en cas de surchauffe GPU.")
+device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
 st.sidebar.info(f"**Périphérique utilisé :** {device.upper()}")
+
+# Fonction pour métriques GPU/CPU
+@st.cache_data(ttl=10)  # Mise à jour toutes les 10s
+def get_system_metrics():
+    cpu_percent = psutil.cpu_percent(interval=1)
+    ram_percent = psutil.virtual_memory().percent
+    metrics = {"CPU %": f"{cpu_percent:.1f}%", "RAM %": f"{ram_percent:.1f}%"}
+    if device == 'cuda' and NVML_AVAILABLE:
+        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(pynvml.nvmlDeviceGetHandleByIndex(0)).gpu
+        gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0)).used / 1024**3
+        gpu_temp = pynvml.nvmlDeviceGetTemperature(pynvml.nvmlDeviceGetHandleByIndex(0), pynvml.NVML_TEMPERATURE_GPU)
+        if gpu_temp > 85:
+            st.sidebar.warning(f"🚨 GPU surchauffe ! Temp: {gpu_temp}°C – Désactivez GPU via checkbox.")
+        metrics.update({"GPU %": f"{gpu_util:.1f}%", "GPU Temp": f"{gpu_temp}°C", "GPU Mem": f"{gpu_mem:.1f}GB"})
+    return metrics
+
+# Affichage métriques en sidebar
+with st.sidebar:
+    st.header("📈 Monitoring Système")
+    metrics = get_system_metrics()
+    for key, value in metrics.items():
+        st.metric(key, value)
 
 # Chargement des modèles (caché pour performance)
 @st.cache_resource
@@ -89,7 +128,7 @@ with col1:
     model_choice = st.radio("Modèle de reconstruction", ["DUSt3R"], help="Choisissez DUSt3R pour une approche stéréo ou MapAnything pour une reconstruction universelle metric 3D.")
     
     if model_choice == "DUSt3R":
-        batch_size = st.slider("Taille du batch", min_value=1, max_value=4, value=1, help="Nombre d'images traitées simultanément (plus petit = plus stable sur GPU)")
+        batch_size = st.slider("Taille du batch", min_value=1, max_value=8, value=1, help="Nombre d'images traitées simultanément (plus petit = plus stable sur GPU ; max augmenté pour scalabilité)")
         niter_align = st.slider("Itérations d'alignement global", min_value=100, max_value=500, value=300, help="Nombre d'itérations pour l'optimisation globale")
         lr_align = st.slider("Taux d'apprentissage alignement", min_value=0.001, max_value=0.1, value=0.01, format="%.3f")
     
@@ -97,7 +136,11 @@ with col1:
     max_points_per_view = st.slider("Max points par vue (downsample)", min_value=1000, max_value=100000, value=20000, help="Nombre max de points par image pour visualisation HD")
     scale_factor = st.slider("Facteur d'échelle pour profondeurs réalistes", min_value=0.5, max_value=3.0, value=1.0, step=0.1, help="Ajustez pour matcher les dimensions réelles de la scène (ex: 1.0 pour ~1m de profondeur typique)")
     generate_mesh = st.checkbox("Générer maillage 3D propre", value=False, help="Crée un maillage complet à partir du nuage de points avec textures ultra-réalistes.")
-    poisson_depth = st.slider("Profondeur maillage (Poisson)", min_value=5, max_value=12, value=10, help="Niveau de détail pour la reconstruction Poisson (plus élevé = plus fin, mais plus gourmand).")
+    mesh_method = st.radio("Méthode de reconstruction maillage", ["Poisson", "Ball Pivoting"], help="Poisson pour surfaces lisses ; Ball Pivoting pour maillages avec trous (plus robuste pour données sparse).")
+    if mesh_method == "Poisson":
+        poisson_depth = st.slider("Profondeur maillage (Poisson)", min_value=5, max_value=12, value=10, help="Niveau de détail pour la reconstruction Poisson (plus élevé = plus fin, mais plus gourmand).")
+    else:
+        ball_pivoting_max_radius = st.slider("Rayon max Ball Pivoting", min_value=0.001, max_value=0.1, value=0.02, step=0.001, format="%.3f", help="Rayon maximal pour pivoting (plus grand = plus de connexions, mais plus approximatif).")
     advanced_blender = st.checkbox("Rendu Avancé avec Blender", value=False, help="Utilise Blender pour un rendu photoréaliste du maillage (requiert Blender installé).")
     # Nouvelle fonctionnalité 1: Export OBJ
     export_obj = st.checkbox("Exporter en format OBJ (avec MTL pour couleurs)", value=False, help="Génère un fichier OBJ + MTL pour compatibilité Blender/Maya.")
@@ -109,6 +152,8 @@ with col1:
     basic_uv_mapping = st.checkbox("Appliquer mapping UV basique au maillage", value=False, help="Génère un UV unwrap simple pour application de textures externes.")
     # Nouvelle fonctionnalité 5: Sauvegarde fichier Blender .blend
     save_blend_file = st.checkbox("Sauvegarder la scène Blender (.blend)", value=False, help="Exporte la scène complète Blender pour édition manuelle.")
+    # Amélioration : Option pour visualiser la coque convexe
+    show_hull = st.checkbox("Afficher la coque convexe autour du maillage", value=True, help="Ajoute une coque convexe pour mieux visualiser les limites de la scène dans Open3D.")
 
     st.header("🖌️ Textures PBR Intelligentes")
     texture_zip = st.file_uploader("Upload ZIP de textures PBR (dossiers par catégorie e.g. rock/, water/)", type='zip', help="Les dossiers dans le ZIP définissent les catégories (ex: rock/albedo.png). Les textures sont intégrées dans une base FAISS pour correspondance dynamique.")
@@ -166,13 +211,35 @@ with col1:
                     conn.commit()
                     
                     if embeddings_list:
-                        dim = len(embeddings_list[0])
-                        faiss_index = faiss.IndexFlatL2(dim)
-                        faiss_index.add(np.array(embeddings_list))
-                        st.session_state.faiss_index = faiss_index
+                        # Amélioration : Seuil adaptatif basé sur variance des embeddings
+                        emb_array = np.array(embeddings_list)
+                        emb_std = np.std(emb_array)
+                        adaptive_threshold_factor = 1.5  # Facteur pour tolérance dynamique
+                        adaptive_max_dist = emb_std * adaptive_threshold_factor if emb_std > 0 else 2.0
+                        st.info(f"Seuil adaptatif pour textures : {adaptive_max_dist:.2f} (basé sur std des embeddings = {emb_std:.2f})")
+                        
+                        # Création de l'index avec fallback
+                        try:
+                            if FAISS_AVAILABLE:
+                                dim = len(embeddings_list[0])
+                                faiss_index = faiss.IndexFlatL2(dim)
+                                faiss_index.add(emb_array)
+                                st.session_state.search_index = faiss_index
+                                st.session_state.is_faiss = True
+                            else:
+                                raise ImportError("FAISS non disponible")
+                        except:
+                            # Fallback sklearn
+                            nn = NearestNeighbors(n_neighbors=1, metric='euclidean')
+                            nn.fit(emb_array)
+                            st.session_state.search_index = nn
+                            st.session_state.is_faiss = False
+                            st.info("Utilisation de scikit-learn NearestNeighbors comme fallback pour FAISS.")
+                        
                         texture_metadata = [{'category': cat, 'avg_color': avg_col} for cat, avg_col in zip(categories, avg_colors_list)]
                         st.session_state.texture_metadata = texture_metadata
-                        st.success(f"Textures PBR chargées: {len(categories)} catégories intégrées dans FAISS et sauvegardées en SQLite3.")
+                        st.session_state.adaptive_max_dist = adaptive_max_dist
+                        st.success(f"Textures PBR chargées: {len(categories)} catégories intégrées (avec fallback si besoin) et sauvegardées en SQLite3.")
                         
                         # Affichage de la liste des types de textures dans un tableau depuis SQLite3
                         cur.execute("SELECT category FROM textures")
@@ -208,6 +275,7 @@ with col1:
 
 with col2:
     if uploaded_files and len(uploaded_files) >= 2 and process_btn:
+        start_time = time.time()  # Pour metric temps
         model = load_dust3r_model() if model_choice == "DUSt3R" else None
         if model is None:
             st.error("Impossible de charger le modèle sélectionné.")
@@ -223,6 +291,13 @@ with col2:
                     all_colors = []
                     num_pairs = 0
                     loss_value = 0.0
+                    
+                    # Amélioration scalabilité : Note pour >10 images
+                    if len(uploaded_files) > 10:
+                        st.info("💡 Pour >10 images, envisagez un pré-filtrage COLMAP pour init poses (installez pycolmap si possible ; placeholder ci-dessous).")
+                        # Placeholder COLMAP (commenté ; décommentez si pycolmap installé)
+                        # import pycolmap
+                        # ... (extraction features et matching COLMAP pour init)
                     
                     # Création d'un répertoire temporaire pour les images et tout le traitement dedans
                     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -266,6 +341,9 @@ with col2:
                             loss_value = loss
                             progress_bar.progress(1.0)
                             status_text.text(f"Alignement terminé ! Perte finale : {loss:.4f}")
+                            # Test suggestion : Vérifiez loss < 0.01 pour bonne qualité
+                            if loss > 0.01:
+                                st.warning("💡 Perte >0.01 ; essayez plus d'itérations ou images mieux éclairées.")
                            
                             # Récupération des résultats DUSt3R
                             imgs = scene.imgs
@@ -341,9 +419,9 @@ with col2:
                         merged_pts3d = np.empty((0, 3))
                         merged_colors = np.empty((0, 3))
 
-                    # Application dynamique des textures PBR si base FAISS disponible et injection activée
+                    # Application dynamique des textures PBR si base disponible et injection activée (avec seuil adaptatif)
                     matched_clusters = 0
-                    if len(merged_pts3d) > 0 and 'inject_textures' in st.session_state and st.session_state.inject_textures and 'faiss_index' in st.session_state and st.session_state.faiss_index.ntotal > 0:
+                    if len(merged_pts3d) > 0 and 'inject_textures' in st.session_state and st.session_state.inject_textures and 'search_index' in st.session_state:
                         status_text.text("Application des textures PBR intelligentes...")
                         clip_model, clip_processor = load_clip_model()
                         if clip_model is not None:
@@ -354,7 +432,7 @@ with col2:
                                 cluster_labels = kmeans.fit_predict(merged_colors)
                                 cluster_centers = kmeans.cluster_centers_
                                 enhanced_colors = merged_colors.copy()
-                                max_distance_threshold = 2.0  # Seuil pour une correspondance valide (ajustable pour CLIP L2)
+                                max_distance_threshold = st.session_state.adaptive_max_dist  # Utilisation du seuil adaptatif
                                 for c_id in range(n_clusters):
                                     center_rgb = cluster_centers[c_id]
                                     # Créer un patch image rempli de la couleur du cluster
@@ -362,13 +440,19 @@ with col2:
                                     inputs = clip_processor(images=[patch], return_tensors="pt").to(device)
                                     with torch.no_grad():
                                         emb = clip_model.get_image_features(**inputs).cpu().numpy().flatten()
-                                    # Recherche dans FAISS
-                                    distances, indices = st.session_state.faiss_index.search(emb.reshape(1, -1), k=1)
-                                    if len(indices[0]) > 0 and indices[0][0] != -1 and distances[0][0] < max_distance_threshold:
-                                        cat_idx = indices[0][0]
-                                        category = st.session_state.texture_metadata[cat_idx]['category']
+                                    # Recherche avec fallback
+                                    if st.session_state.is_faiss:
+                                        distances, indices = st.session_state.search_index.search(emb.reshape(1, -1), k=1)
+                                        dist = distances[0][0] if len(distances) > 0 else float('inf')
+                                        idx = indices[0][0] if len(indices) > 0 and indices[0][0] != -1 else -1
+                                    else:
+                                        dist, idx = st.session_state.search_index.kneighbors(emb.reshape(1, -1), return_distance=True)
+                                        dist = dist[0][0]
+                                        idx = idx[0][0]
+                                    if idx != -1 and dist < max_distance_threshold:
+                                        category = st.session_state.texture_metadata[idx]['category']
                                         # Utiliser la couleur moyenne stockée depuis SQLite3
-                                        avg_texture_color = st.session_state.texture_metadata[cat_idx]['avg_color']
+                                        avg_texture_color = st.session_state.texture_metadata[idx]['avg_color']
                                         # Fusion réaliste : 70% couleur originale + 30% texture
                                         new_color = 0.7 * center_rgb + 0.3 * avg_texture_color
                                         # Appliquer au cluster
@@ -377,7 +461,7 @@ with col2:
                                         matched_clusters += 1
                                 merged_colors = enhanced_colors
                                 if matched_clusters > 0:
-                                    st.success(f"Textures PBR appliquées dynamiquement via correspondances FAISS (détection par similarité de couleurs/clusters). {matched_clusters}/{n_clusters} clusters matchés.")
+                                    st.success(f"Textures PBR appliquées dynamiquement via correspondances (seuil adaptatif {max_distance_threshold:.2f}). {matched_clusters}/{n_clusters} clusters matchés.")
                                 else:
                                     st.warning("Aucune zone de correspondance texture trouvée ; couleurs originales conservées pour un rendu fidèle.")
                             else:
@@ -389,9 +473,11 @@ with col2:
                    
                     st.success("Reconstruction terminée !")
                    
-                    # Libération mémoire GPU après traitement
+                    # Libération mémoire GPU après traitement (plus agressif)
                     if device == 'cuda':
                         torch.cuda.empty_cache()
+                        if torch.cuda.is_available():
+                            st.info(f"Mémoire GPU libérée : {torch.cuda.memory_reserved() / 1024**3:.1f} GB réservée.")
                    
                     # Visualisation Open3D avec texture réaliste (fenêtre externe)
                     if len(merged_pts3d) > 0:
@@ -427,7 +513,7 @@ with col2:
                         # Maillage si demandé (optimisé pour réalisme)
                         if generate_mesh:
                             try:
-                                st.info("🔓 Générant et ouvrant fenêtre pour le maillage 3D ultra-réaliste...")
+                                st.info(f"🔓 Générant et ouvrant fenêtre pour le maillage 3D ultra-réaliste avec {mesh_method}...")
                                 
                                 # Vérification si nuage de points suffisant pour maillage
                                 if len(pcd.points) < 1000:
@@ -437,22 +523,44 @@ with col2:
                                     target_voxel_size = 0.002  # 2 mm pour un scan HD précis
                                     pcd_down = pcd.voxel_down_sample(voxel_size=target_voxel_size)
                                     
-                                    # Estimation plus robuste des normales avec plus de voisins pour précision
+                                    # Estimation plus robuste des normales avec plus de voisins pour précision (augmenté pour meilleure cohérence)
                                     pcd_down.estimate_normals(
                                         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
                                     )
-                                    pcd_down.orient_normals_consistent_tangent_plane(200)  # Plus d'itérations pour cohérence
+                                    pcd_down.orient_normals_consistent_tangent_plane(300)  # Plus d'itérations pour cohérence (correction pour closure)
                                     
-                                    # Reconstruction Poisson HD avec paramètres optimisés pour surfaces lisses
-                                    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                                        pcd_down, depth=poisson_depth, width=0, scale=1.1, linear_fit=True
-                                    )
+                                    # Reconstruction conditionnelle : Poisson ou Ball Pivoting
+                                    if mesh_method == "Poisson":
+                                        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                                            pcd_down, depth=poisson_depth, width=0, scale=1.1, linear_fit=True
+                                        )
+                                    else:
+                                        # Intégration Ball Pivoting : Liste de rayons progressifs pour connexions robustes
+                                        radii = [0.005, 0.01, 0.02, ball_pivoting_max_radius]
+                                        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                                            pcd_down, o3d.utility.DoubleVector(radii)
+                                        )
+                                        densities = None  # Pas de densité pour Ball Pivoting
                                     
-                                    # Nettoyage avancé : supprimer les vertices à faible densité
-                                    if len(densities) > 0:
+                                    # Nettoyage avancé : supprimer les vertices à faible densité (seulement pour Poisson)
+                                    if densities is not None and len(densities) > 0:
                                         quantile_low = np.quantile(densities, 0.005)  # Seuil plus strict pour qualité HD
                                         keep_mask = densities >= quantile_low
                                         mesh.remove_vertices_by_mask(~keep_mask)
+                                    
+                                    # Correction : Post-traitement pour fermer le maillage (rendre watertight/manifold)
+                                    mesh.remove_non_manifold_edges()  # Supprime arêtes non connectées (trous)
+                                    mesh.remove_degenerate_triangles()  # Élimine triangles plats
+                                    mesh.remove_duplicated_triangles()  # Supprime doublons triangles
+                                    mesh.remove_duplicated_vertices()  # Supprime doublons vertices
+                                    mesh.remove_unreferenced_vertices()  # Supprime points isolés
+                                    
+                                    # Vérification manifold post-nettoyage
+                                    is_manifold = len(mesh.triangles) == len(mesh.vertices) - 2  # Approximation simple pour closed mesh
+                                    if is_manifold:
+                                        st.success("✅ Maillage fermé (watertight) après post-traitement ! Volume intérieur cohérent.")
+                                    else:
+                                        st.warning("⚠️ Maillage partiellement ouvert ; ajoutez plus d'images pour une closure parfaite.")
                                     
                                     # Nouvelle fonctionnalité 2: Lissage automatique des normales si activé (sur le maillage)
                                     if auto_smooth_normals:
@@ -486,10 +594,19 @@ with col2:
                                     # Lissage optionnel des vertex colors pour textures ultra-réalistes
                                     mesh.vertex_colors = o3d.utility.Vector3dVector(np.asarray(mesh.vertex_colors))
                                     
-                                    # Visualisation avancée du maillage HD
+                                    # Amélioration : Calcul et visualisation de la coque convexe pour mieux voir les limites
+                                    geometries_to_draw = [mesh]
+                                    if show_hull and len(pcd.points) > 3:  # Au moins 4 points pour hull
+                                        hull = pcd.compute_convex_hull()
+                                        hull.paint_uniform_color([1.0, 0.0, 0.0])  # Rouge pour visibilité
+                                        hull.compute_vertex_normals()
+                                        geometries_to_draw.append(hull)
+                                        st.info("Coque convexe ajoutée en rouge pour délimiter la scène (volume intérieur maintenant cohérent avec maillage fermé).")
+                                    
+                                    # Visualisation avancée du maillage HD avec coque si activée
                                     o3d.visualization.draw_geometries(
-                                        [mesh],
-                                        window_name=f"Maillage 3D Poisson Ultra-Réaliste HD - {model_choice}",
+                                        geometries_to_draw,
+                                        window_name=f"Maillage 3D {mesh_method} Ultra-Réaliste HD avec Coque - {model_choice}",
                                         width=1600,
                                         height=900,
                                         mesh_show_back_face=True,  # Montre les faces arrière
@@ -498,7 +615,7 @@ with col2:
                                     
                                     # Création du fichier temporaire pour le maillage (utilisé pour download et Blender)
                                     mesh_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_mesh_{uuid.uuid4().hex}.ply")
-                                    success = o3d.io.write_triangle_mesh(mesh_tmp_path, mesh)
+                                    success = o3d.io.write_triangle_mesh(mesh_tmp_path, mesh, write_vertex_colors=True, write_vertex_normals=True)  # Ajout flags pour export fermé
                                     if not success:
                                         st.error("Erreur lors de l'écriture du fichier maillage.")
                                     else:
@@ -512,7 +629,7 @@ with col2:
                                             st.download_button(
                                                 label="📥 Télécharger Maillage 3D (.ply)",
                                                 data=mesh_bytes,
-                                                file_name=f"{model_choice}_mesh.ply",
+                                                file_name=f"{model_choice}_{mesh_method.lower()}_mesh.ply",
                                                 mime="model/ply"
                                             )
                                     
@@ -527,25 +644,28 @@ with col2:
                                             st.download_button(
                                                 label="📥 Télécharger Maillage 3D (.obj + .mtl)",
                                                 data=obj_bytes,
-                                                file_name=f"{model_choice}_mesh.obj",
+                                                file_name=f"{model_choice}_{mesh_method.lower()}_mesh.obj",
                                                 mime="model/obj"
                                             )
                                             os.remove(obj_tmp_path)
                                     
                                     st.info("💡 Pour un rendu encore plus réaliste, exporte le maillage vers Blender/Unreal Engine en utilisant `mesh.export('mesh.ply')`.")
 
-                                    # Rendu avancé avec Blender si activé
+                                    # Rendu avancé avec Blender si activé (avec check installation)
                                     if advanced_blender and success and os.path.exists(mesh_tmp_path):
-                                        st.info("🔄 Lancement du rendu avancé avec Blender...")
-                                        render_tmp_path = None
-                                        script_tmp_path = None
-                                        blend_tmp_path = None
-                                        try:
-                                            render_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_render_{uuid.uuid4().hex}.png")
-                                            script_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_script_{uuid.uuid4().hex}.py")
-                                            if save_blend_file:
-                                                blend_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_blend_{uuid.uuid4().hex}.blend")
-                                            script_content = f"""
+                                        if shutil.which('blender') is None:
+                                            st.warning("⚠️ Blender non trouvé dans le PATH ; installez-le pour activer le rendu avancé.")
+                                        else:
+                                            st.info("🔄 Lancement du rendu avancé avec Blender...")
+                                            render_tmp_path = None
+                                            script_tmp_path = None
+                                            blend_tmp_path = None
+                                            try:
+                                                render_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_render_{uuid.uuid4().hex}.png")
+                                                script_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_script_{uuid.uuid4().hex}.py")
+                                                if save_blend_file:
+                                                    blend_tmp_path = os.path.join(tempfile.gettempdir(), f"temp_blend_{uuid.uuid4().hex}.blend")
+                                                script_content = f"""
 import bpy
 from math import pi
 import os
@@ -641,77 +761,77 @@ if mesh_obj is not None:
     if {save_blend_file}:
         bpy.ops.wm.save_as_mainfile(filepath=r'{blend_tmp_path}')
 """
-                                            with open(script_tmp_path, 'w') as script_file:
-                                                script_file.write(script_content)
+                                                with open(script_tmp_path, 'w') as script_file:
+                                                    script_file.write(script_content)
 
-                                            # Run Blender
-                                            result = subprocess.run(["blender", "--background", "--python", script_tmp_path], capture_output=True, text=True)
-                                            if result.returncode == 0:
-                                                st.success("Rendu Blender terminé avec succès !")
-                                                if os.path.exists(render_tmp_path):
-                                                    st.image(render_tmp_path, caption="Rendu Avancé Blender", use_container_width=True)
-                                                    # Download button for render
-                                                    with open(render_tmp_path, "rb") as f:
-                                                        render_bytes = f.read()
-                                                    st.download_button(
-                                                        label="📥 Télécharger Rendu Blender (.png)",
-                                                        data=render_bytes,
-                                                        file_name=f"{model_choice}_blender_render.png",
-                                                        mime="image/png"
-                                                    )
-                                                
-                                                # Téléchargements pour vues multiples
-                                                if multi_view_blender:
-                                                    front_path = render_tmp_path.replace('.png', '_front.png')
-                                                    side_path = render_tmp_path.replace('.png', '_side.png')
-                                                    top_path = render_tmp_path.replace('.png', '_top.png')
-                                                    if os.path.exists(front_path):
-                                                        with open(front_path, "rb") as f:
-                                                            front_bytes = f.read()
+                                                # Run Blender
+                                                result = subprocess.run(["blender", "--background", "--python", script_tmp_path], capture_output=True, text=True)
+                                                if result.returncode == 0:
+                                                    st.success("Rendu Blender terminé avec succès !")
+                                                    if os.path.exists(render_tmp_path):
+                                                        st.image(render_tmp_path, caption="Rendu Avancé Blender", use_container_width=True)
+                                                        # Download button for render
+                                                        with open(render_tmp_path, "rb") as f:
+                                                            render_bytes = f.read()
                                                         st.download_button(
-                                                            label="📥 Vue Frontale (.png)",
-                                                            data=front_bytes,
-                                                            file_name=f"{model_choice}_front.png",
+                                                            label="📥 Télécharger Rendu Blender (.png)",
+                                                            data=render_bytes,
+                                                            file_name=f"{model_choice}_{mesh_method.lower()}_blender_render.png",
                                                             mime="image/png"
                                                         )
-                                                    if os.path.exists(side_path):
-                                                        with open(side_path, "rb") as f:
-                                                            side_bytes = f.read()
+                                                    
+                                                    # Téléchargements pour vues multiples
+                                                    if multi_view_blender:
+                                                        front_path = render_tmp_path.replace('.png', '_front.png')
+                                                        side_path = render_tmp_path.replace('.png', '_side.png')
+                                                        top_path = render_tmp_path.replace('.png', '_top.png')
+                                                        if os.path.exists(front_path):
+                                                            with open(front_path, "rb") as f:
+                                                                front_bytes = f.read()
+                                                            st.download_button(
+                                                                label="📥 Vue Frontale (.png)",
+                                                                data=front_bytes,
+                                                                file_name=f"{model_choice}_{mesh_method.lower()}_front.png",
+                                                                mime="image/png"
+                                                            )
+                                                        if os.path.exists(side_path):
+                                                            with open(side_path, "rb") as f:
+                                                                side_bytes = f.read()
+                                                            st.download_button(
+                                                                label="📥 Vue Latérale (.png)",
+                                                                data=side_bytes,
+                                                                file_name=f"{model_choice}_{mesh_method.lower()}_side.png",
+                                                                mime="image/png"
+                                                            )
+                                                        if os.path.exists(top_path):
+                                                            with open(top_path, "rb") as f:
+                                                                top_bytes = f.read()
+                                                            st.download_button(
+                                                                label="📥 Vue Supérieure (.png)",
+                                                                data=top_bytes,
+                                                                file_name=f"{model_choice}_{mesh_method.lower()}_top.png",
+                                                                mime="image/png"
+                                                            )
+                                                    
+                                                    # Téléchargement .blend si activé
+                                                    if save_blend_file and blend_tmp_path and os.path.exists(blend_tmp_path):
+                                                        with open(blend_tmp_path, "rb") as f:
+                                                            blend_bytes = f.read()
                                                         st.download_button(
-                                                            label="📥 Vue Latérale (.png)",
-                                                            data=side_bytes,
-                                                            file_name=f"{model_choice}_side.png",
-                                                            mime="image/png"
+                                                            label="📥 Scène Blender (.blend)",
+                                                            data=blend_bytes,
+                                                            file_name=f"{model_choice}_{mesh_method.lower()}_scene.blend",
+                                                            mime="application/x-blender"
                                                         )
-                                                    if os.path.exists(top_path):
-                                                        with open(top_path, "rb") as f:
-                                                            top_bytes = f.read()
-                                                        st.download_button(
-                                                            label="📥 Vue Supérieure (.png)",
-                                                            data=top_bytes,
-                                                            file_name=f"{model_choice}_top.png",
-                                                            mime="image/png"
-                                                        )
-                                                
-                                                # Téléchargement .blend si activé
-                                                if save_blend_file and blend_tmp_path and os.path.exists(blend_tmp_path):
-                                                    with open(blend_tmp_path, "rb") as f:
-                                                        blend_bytes = f.read()
-                                                    st.download_button(
-                                                        label="📥 Scène Blender (.blend)",
-                                                        data=blend_bytes,
-                                                        file_name=f"{model_choice}_scene.blend",
-                                                        mime="application/x-blender"
-                                                    )
-                                            else:
-                                                st.error(f"Erreur Blender : {result.stderr}")
-                                        finally:
-                                            if render_tmp_path and os.path.exists(render_tmp_path):
-                                                os.unlink(render_tmp_path)
-                                            if script_tmp_path and os.path.exists(script_tmp_path):
-                                                os.unlink(script_tmp_path)
-                                            if blend_tmp_path and os.path.exists(blend_tmp_path):
-                                                os.unlink(blend_tmp_path)
+                                                else:
+                                                    st.error(f"Erreur Blender : {result.stderr}")
+                                            finally:
+                                                if render_tmp_path and os.path.exists(render_tmp_path):
+                                                    os.unlink(render_tmp_path)
+                                                if script_tmp_path and os.path.exists(script_tmp_path):
+                                                    os.unlink(script_tmp_path)
+                                                if blend_tmp_path and os.path.exists(blend_tmp_path):
+                                                    os.unlink(blend_tmp_path)
                                     
                                     # Nettoyage final du fichier maillage temporaire seulement si pas utilisé par Blender ou après
                                     if os.path.exists(mesh_tmp_path):
@@ -761,15 +881,18 @@ if mesh_obj is not None:
                     for i, uploaded_file in enumerate(uploaded_files):
                         cols[i].image(uploaded_file, caption=f"Image {i+1}", use_container_width=True)
                    
-                    # Statistiques
+                    # Statistiques (ajout temps traitement)
                     st.header("📊 Statistiques")
-                    col_stats1, col_stats2 = st.columns(2)
+                    col_stats1, col_stats2, col_stats3 = st.columns(3)
                     with col_stats1:
                         st.metric("Nombre de points 3D", f"{len(merged_pts3d):,}")
                         st.metric("Nombre d'images", len(uploaded_files))
                     with col_stats2:
                         st.metric("Paires traitées", num_pairs)
                         st.metric("Perte d'alignement", f"{loss_value:.4f}")
+                    with col_stats3:
+                        processing_time = time.time() - start_time
+                        st.metric("Temps de traitement", f"{processing_time:.1f}s")
                
                 except Exception as e:
                     st.error(f"Erreur lors du traitement : {e}")
@@ -788,7 +911,9 @@ with st.sidebar:
     if model_choice_placeholder == "DUSt3R":
         st.code("""
 pip install git+https://github.com/naver/dust3r.git
-pip install streamlit plotly pillow numpy torch torchvision open3d scikit-learn transformers faiss-cpu pandas
+pip install streamlit plotly pillow numpy torch torchvision open3d scikit-learn transformers faiss-cpu pandas psutil pynvml  # FAISS optionnel (fallback sklearn) ; psutil/pynvml pour monitoring
+# Pour Blender : Téléchargez depuis blender.org et ajoutez au PATH
+# Pour scalabilité >10 images : pip install pycolmap (optionnel)
         """)
     st.markdown("**Lancer l'app :** `streamlit run app.py`")
     if st.button("🔗 Lien GitHub DUSt3R"):

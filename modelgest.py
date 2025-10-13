@@ -379,6 +379,15 @@ def cleanup_non_standard_models():
                 st.error(f"Erreur suppression {model['Nom']}: {e}")
     return deleted
 
+def delete_model(model_path: str):
+    """Supprime un modèle spécifique par son chemin"""
+    try:
+        shutil.rmtree(model_path)
+        return True
+    except Exception as e:
+        st.error(f"Erreur lors de la suppression: {e}")
+        return False
+
 def list_models():
     models_list = []
     MIN_SIZE = 1024 * 1024  # 1MB
@@ -473,6 +482,16 @@ if models:
     )
     for model in models:
         with st.expander(f"🔍 Détails pour {model['Nom']} (survol/copie chemins relatifs)"):
+            col_del1, col_del2 = st.columns(2)
+            with col_del1:
+                if st.button("🗑️ Supprimer ce modèle", key=f"delete_confirm_{model['Nom']}"):
+                    pass  # Placeholder for button
+            with col_del2:
+                if st.button("✅ Confirmer suppression", key=f"delete_exec_{model['Nom']}"):
+                    with st.spinner("Suppression en cours..."):
+                        if delete_model(model['Chemin']):
+                            st.success(f"✅ Modèle '{model['Nom']}' supprimé avec succès.")
+                            st.rerun()
             model_path = Path(model['Chemin'])
             structure = get_model_structure(model_path)
             if structure:
