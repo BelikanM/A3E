@@ -11,6 +11,7 @@ import requests
 import queue
 import threading
 import time
+import sys
 
 try:
     import psutil
@@ -25,6 +26,13 @@ try:
 except ImportError:
     SAFE_TENSORS_AVAILABLE = False
     st.warning("safetensors non installé. Installez-le avec 'pip install safetensors' pour charger les fichiers .safetensors.")
+
+try:
+    from transformers import AutoModel, AutoConfig
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    st.warning("transformers non installé. Installez-le avec 'pip install transformers' pour charger les modèles standard HF.")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -59,7 +67,8 @@ CUSTOM_IMPORTS = {
 config = LRMGeneratorConfig()
 model = LRMGenerator(config)
 processor = LRMImageProcessor()
-"""
+""",
+        "main_class": "LRMGenerator"
     }
     # Ajoutez d'autres comme "facebook/vfusion3d" avec leurs imports spécifiques si disponibles
 }
@@ -379,6 +388,20 @@ def cleanup_non_standard_models():
                 st.error(f"Erreur suppression {model['Nom']}: {e}")
     return deleted
 
+def cleanup_non_functional_models():
+    """Supprime automatiquement les modèles non fonctionnels"""
+    deleted = []
+    models = list_models()
+    for model in models:
+        is_func, _ = verify_model(model)
+        if not is_func:
+            try:
+                shutil.rmtree(model['Chemin'])
+                deleted.append(model['Nom'])
+            except Exception as e:
+                st.error(f"Erreur suppression {model['Nom']}: {e}")
+    return deleted
+
 def delete_model(model_path: str):
     """Supprime un modèle spécifique par son chemin"""
     try:
@@ -421,30 +444,74 @@ def list_models():
             pass  # Ignore errors in listing
     return models_list
 
-def find_safetensors_files(model_path: Path):
+def find_weight_files(model_path: Path):
     """
-    Trouve les fichiers .safetensors dans un dossier de modèle HF (avec snapshots ou en racine).
+    Cherche tous les fichiers de poids connus pour un modèle HuggingFace ou custom :
+    - .safetensors
+    - .bin
+    - .pt
+    - .ckpt
     """
-    safetensors_files = []
-    snapshots_dir = model_path / "snapshots"
-    if snapshots_dir.exists():
-        for snapshot_dir in snapshots_dir.iterdir():
-            for f in snapshot_dir.glob("*.safetensors"):
-                safetensors_files.append(f)
-    else:
-        # Si pas de snapshots, cherche en racine
-        for f in model_path.glob("*.safetensors"):
-            safetensors_files.append(f)
-    return safetensors_files
+    weight_files = []
+    for ext in [".safetensors", ".bin", ".pt", ".ckpt"]:
+        weight_files.extend(list(model_path.rglob(f"*{ext}")))
+    return weight_files
 
-def load_safetensors_weights(file_path: Path):
+def load_weights(file_path: Path):
     """
-    Charge les poids d'un fichier .safetensors de manière sécurisée.
+    Charge les poids d'un fichier de manière sécurisée, selon l'extension.
     """
-    if not SAFE_TENSORS_AVAILABLE:
-        raise ImportError("safetensors requis pour charger les fichiers .safetensors. Installez-le avec 'pip install safetensors'.")
+    ext = file_path.suffix
     device = "cpu"
-    return load_file(str(file_path), device=device)
+    if ext == ".safetensors":
+        if not SAFE_TENSORS_AVAILABLE:
+            raise ImportError("safetensors requis pour charger les fichiers .safetensors. Installez-le avec 'pip install safetensors'.")
+        return load_file(str(file_path), device=device)
+    elif ext in [".bin", ".pt", ".ckpt"]:
+        return torch.load(file_path, map_location=device)
+    else:
+        raise ValueError(f"Extension non supportée : {ext}")
+
+def verify_model(model: dict):
+    model_path = model['Chemin']
+    repo_id = model['RepoID']
+    is_standard = model['Standard HF'] == "Oui"
+    if is_standard:
+        if not TRANSFORMERS_AVAILABLE:
+            return False, "transformers requis pour vérifier les modèles standard."
+        try:
+            config = AutoConfig.from_pretrained(model_path)
+            # Test minimal sans charger le modèle entier
+            return True, f"Config chargée : {config.model_type}"
+        except Exception as e:
+            return False, f"Erreur config : {e}"
+    else:
+        model_dir = Path(model_path)
+        sys.path.append(str(model_dir))
+        
+        # Cherche un fichier de poids
+        weight_files = find_weight_files(model_dir)
+        if not weight_files:
+            return False, "Aucun poids trouvé"
+    
+        # Tente d'importer la classe principale si custom
+        if repo_id in CUSTOM_IMPORTS:
+            main_class = CUSTOM_IMPORTS[repo_id].get("main_class", None)
+            if main_class:
+                try:
+                    module = __import__("modeling", fromlist=[main_class])
+                    cls = getattr(module, main_class)
+                except Exception as e:
+                    return False, f"Import error: {e}"
+    
+        # Tente de charger le poids (CPU uniquement)
+        try:
+            file_path = weight_files[0]
+            load_weights(file_path)
+        except Exception as e:
+            return False, f"Poids non chargés: {e}"
+    
+        return True, "Modèle fonctionnel"
 
 # ===============================
 # INTERFACE STREAMLIT
@@ -550,21 +617,29 @@ sys.path.append(str(MODEL_PATH))
             # Nouvelle fonctionnalité : Chargement direct des poids pour modèles non-standard HF
             if model['Type'] == "HuggingFace" and model['Standard HF'] == "Non":
                 st.subheader("🔧 Chargement direct des poids (.safetensors)")
-                safetensors = find_safetensors_files(model_path)
-                if safetensors:
-                    st.write("**Fichiers .safetensors disponibles :**")
-                    for f in safetensors:
+                weight_files = find_weight_files(model_path)
+                if weight_files:
+                    st.write("**Fichiers de poids disponibles :**")
+                    for f in weight_files:
                         rel_path = f.relative_to(model_path)
                         st.write(f"• `{rel_path}` (taille: {sizeof_fmt(f.stat().st_size)})")
 
                     # Sélectionne le plus grand fichier (souvent le principal)
-                    main_file = max(safetensors, key=lambda p: p.stat().st_size)
+                    main_file = max(weight_files, key=lambda p: p.stat().st_size)
                     device_str = "cpu"
                     load_weights_code = f"""from safetensors.torch import load_file
+import torch
 from pathlib import Path
 
 file_path = Path(r\"{main_file}\")
-state_dict = load_file(str(file_path), device=\"{device_str}\")
+ext = file_path.suffix
+
+if ext == ".safetensors":
+    state_dict = load_file(str(file_path), device=\"{device_str}\")
+elif ext in [".bin", ".pt", ".ckpt"]:
+    state_dict = torch.load(file_path, map_location=\"{device_str}\")
+else:
+    raise ValueError(f\"Extension non supportée : {{ext}}\")
 
 # Aperçu
 if state_dict:
@@ -577,36 +652,58 @@ if state_dict:
 
                     col1, col2 = st.columns([1, 3])
                     with col1:
-                        if st.button("🔍 Aperçu des poids", key=f"preview_weights_{model['Nom']}"):
-                            with st.spinner("Chargement des poids... (peut prendre du temps pour gros modèles)"):
+                        if st.button("🔍 Vérifier le modèle", key=f"preview_weights_{model['Nom']}"):
+                            with st.spinner("Vérification en cours..."):
                                 try:
-                                    if not SAFE_TENSORS_AVAILABLE:
-                                        raise ImportError("safetensors requis. Installez-le avec 'pip install safetensors'.")
-                                    state_dict = load_safetensors_weights(main_file)
-                                    st.success("✅ Poids chargés avec succès !")
-                                    if state_dict:
-                                        first_key = next(iter(state_dict))
-                                        shape = state_dict[first_key].shape
-                                        num_keys = len(state_dict)
-                                        st.info(f"**Première clé :** `{first_key}`")
-                                        st.info(f"**Shape du tensor :** `{shape}`")
-                                        st.write(f"**Nombre total de clés :** {num_keys:,}")
+                                    is_func, msg = verify_model(model)
+                                    if is_func:
+                                        st.success(f"✅ {msg}")
                                     else:
-                                        st.warning("State dict vide.")
+                                        st.error(f"❌ {msg}")
                                 except Exception as e:
-                                    st.error(f"❌ Erreur lors du chargement : {str(e)}")
-                                    st.caption("Vérifiez si safetensors est installé ou essayez manuellement.")
+                                    st.error(f"❌ Erreur lors de la vérification : {str(e)}")
                 else:
-                    st.warning("❌ Aucun fichier .safetensors trouvé dans ce modèle.")
+                    st.warning("❌ Aucun fichier de poids trouvé dans ce modèle.")
+            else:
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if st.button("🔍 Vérifier le modèle", key=f"preview_standard_{model['Nom']}"):
+                        with st.spinner("Vérification en cours..."):
+                            try:
+                                is_func, msg = verify_model(model)
+                                if is_func:
+                                    st.success(f"✅ {msg}")
+                                else:
+                                    st.error(f"❌ {msg}")
+                            except Exception as e:
+                                st.error(f"❌ Erreur lors de la vérification : {str(e)}")
             
 else:
     st.info("Aucun modèle trouvé dans les caches.")
 
 # -------------------------------
+# Agent Central
+# -------------------------------
+st.subheader("🤖 Agent Central")
+st.info("Cet agent central teste tous les modèles disponibles et affiche les résultats en temps réel.")
+if st.button("Tester tous les modèles"):
+    with st.spinner("Test en cours..."):
+        results = []
+        for model in models:
+            is_func, msg = verify_model(model)
+            results.append({
+                "Nom": model['Nom'],
+                "Type": "Standard HF" if model['Standard HF'] == "Oui" else "Custom",
+                "Fonctionnel": "Oui" if is_func else "Non",
+                "Détails": msg
+            })
+        st.dataframe(results, use_container_width=True)
+
+# -------------------------------
 # Nettoyage automatique
 # -------------------------------
 st.subheader("🧹 Nettoyage des modèles incomplets")
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     if st.button("Nettoyer automatiquement les modèles incomplets (<1MB)"):
         with st.spinner("Nettoyage en cours..."):
@@ -642,6 +739,18 @@ with col3:
                 st.write(f"- {d}")
         else:
             st.info("ℹ️ Aucun modèle non-standard trouvé.")
+        models = list_models()
+        st.dataframe(models, use_container_width=True)
+with col4:
+    if st.button("Supprimer les modèles non fonctionnels"):
+        with st.spinner("Suppression des non-fonctionnels en cours..."):
+            deleted = cleanup_non_functional_models()
+        if deleted:
+            st.success(f"✅ {len(deleted)} modèles non fonctionnels supprimés.")
+            for d in deleted:
+                st.write(f"- {d}")
+        else:
+            st.info("ℹ️ Aucun modèle non fonctionnel trouvé.")
         models = list_models()
         st.dataframe(models, use_container_width=True)
 

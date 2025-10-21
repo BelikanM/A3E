@@ -55,7 +55,7 @@ except ImportError:
 try:
     from diffusers import StableDiffusionXLPipeline
     from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-    from transformers import AutoFeatureExtractor
+    from transformers import CLIPImageProcessor
     DIFFUSERS_AVAILABLE = True
 except ImportError:
     DIFFUSERS_AVAILABLE = False
@@ -146,15 +146,17 @@ def load_ai_model():
     bitsandbytes_available = False
     try:
         import bitsandbytes as bnb
+        from transformers import BitsAndBytesConfig
         bitsandbytes_available = True
     except ImportError:
         pass
     if torch.cuda.is_available():
         if bitsandbytes_available:
             try:
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
                 model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    load_in_8bit=True,
+                    quantization_config=quantization_config,
                     device_map="auto"
                 )
                 precision_msg = f"Modèle chargé en 8-bit sur GPU (dtype: {model.dtype}). Optimisation mémoire activée."
@@ -274,7 +276,7 @@ def load_image_gen_model():
     st.info(f"Téléchargement et chargement du Safety Checker {safety_model_id}...")
     try:
         safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
-        feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+        feature_extractor = CLIPImageProcessor.from_pretrained(safety_model_id)
         st.success("✅ Modèle Safety Checker chargé avec succès !")
     except Exception as e:
         st.warning(f"Erreur Safety Checker : {e}. Désactivation.")
@@ -467,7 +469,7 @@ if uploaded_file:
             try:
                 dt1_struct = Struct(
                     "header" / Array(20, Int16ul), # Header hypothétique de 20 uint16 (metadata, nombre de points, etc.)
-                    "data" / GreedyRange(Int16ul) # Le reste comme données de résistivité (rhoa)
+                    "data" / GreedyRange(Int16ul) # Le reste comme données de données de résistivité (rhoa)
                 )
                 parsed = dt1_struct.parse(content)
                 data = np.array(parsed.data, dtype=np.float64) # Conversion en float pour rhoa
@@ -530,10 +532,10 @@ if uploaded_file:
                 tmp.write(content)
                 tmp_path = tmp.name
             try:
-                # Utiliser load au lieu de importData pour une meilleure gestion des formats
-                data_ert = ert.load(tmp_path)
+                # Utiliser importData au lieu de load pour une meilleure gestion des formats
+                data_ert = ert.importData(tmp_path)
                 if data_ert is None:
-                    raise ValueError("ert.load a retourné None - format non supporté ?")
+                    raise ValueError("ert.importData a retourné None - format non supporté ?")
                 st.info("Chargement .dat réussi avec pyGIMLi.")
             except Exception as load_e:
                 st.warning(f"⚠️ Erreur chargement .dat : {load_e}. Fallback vers données synthétiques parsées.")
@@ -544,7 +546,7 @@ if uploaded_file:
         if data_ert is None:
             # Conversion simplifiée : création de données synthétiques avec rhoa des données (amélioré)
             n_elec = min(50, max(10, int(np.sqrt(len(data))) * 2))
-            data_ert = ert.createData(elecs=n_elec, schemeName='dd', spacing=electrode_spacing, noiseLevel=0.05)
+            data_ert = ert.createData(elecs=np.linspace(0, (n_elec-1)*electrode_spacing, n_elec), schemeName='dd', noiseLevel=0.05)
             if len(data) > 0:
                 data_ert["rhoa"][:min(len(data), data_ert.size())] = data[:min(len(data), data_ert.size())]
         
@@ -703,6 +705,7 @@ if uploaded_file:
             else:
                 # Fallback SmolLM
                 inputs = tokenizer(prompt, return_tensors="pt")
+                inputs = {k: v.to(device) for k, v in inputs.items()}
                 with torch.no_grad():
                     outputs = model.generate(**inputs, max_new_tokens=300)
                 ai_interpretation = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -880,7 +883,7 @@ if uploaded_file:
         for cl in range(n_clusters):
             matching = materials_df[(materials_df["Plage Min (Ωm)"] <= cluster_means[cl]) & (materials_df["Plage Max (Ωm)"] >= cluster_means[cl])]
             if not matching.empty:
-                fig4.add_annotation(text=f"Cluster {cl}: {matching['Type'].iloc[0]}", x=0.02, y=1 - cl*0.15, showarrow=False, font=dict(size=12, color="black"))
+                fig4.add_annotation(text=f"Cluster {cl}: {matching['Type'].iloc[0]}", x=0.02, y=1 - cl*0.15, showarrow=False, font=dict(color="black"))
         fig4.update_layout(
             title="4. Section 2D Clustering Minéral (Interprétation via LLaMA, Focus Minéraux)",
             xaxis_title="Distance (m)",
@@ -1200,7 +1203,7 @@ Ces techniques peuvent être intégrées pour améliorer la précision, la profo
         generate_viz_image("contours de résistivité style Res2DInv, lignes de contour avec labels numériques en Ωm (échelle log), zones colorées bleu-vert-jaune-orange-rouge, profondeur et position X annotées, labels pour minéraux comme galena/pyrite.", "Contours Style Res2DInv", materials_df)
     
     with viz_tabs[3]:
-        generate_viz_image("reconstruction 3D volumétrique du sous-sol ERT, vue en perspective avec iso-surfaces semi-transparentes, couleurs Res2DInv pour résistivité, axes X/Y/Z (position, largeur, profondeur), inclure coupes transversales et légendes minérales.", "Tomographie 3D Générée par IA", materials_df)
+        generate_viz_image("reconstruction 3D volumétrique du sous-sol ERT, vue en perspective avec iso-surfaces semi-transparentes, couleurs Res2DInv pour résistivité, axes X/Y/Z (position, largeur, profondeur), inclure coupes transversales avec légendes minérales.", "Tomographie 3D Générée par IA", materials_df)
 
     # Nouvelle section : 10 Graphiques Supplémentaires Générés par IA LLM basés sur RAG
     st.subheader("🖼️ 10 Graphiques Supplémentaires Générés par IA (Basés sur Études RAG et Calculs Données)")
@@ -1219,6 +1222,7 @@ Ces techniques peuvent être intégrées pour améliorer la précision, la profo
                 prompts_text = output['choices'][0]['text'].strip()
             else:
                 inputs = tokenizer(graph_prompt, return_tensors="pt")
+                inputs = {k: v.to(device) for k, v in inputs.items()}
                 with torch.no_grad():
                     outputs = model.generate(**inputs, max_new_tokens=800)
                 prompts_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -1315,6 +1319,7 @@ Ces techniques peuvent être intégrées pour améliorer la précision, la profo
                 else:
                     # Fallback SmolLM
                     inputs = tokenizer(ai_prompt, return_tensors="pt")
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
                     with torch.no_grad():
                         outputs = model.generate(**inputs, max_new_tokens=50)
                     prompt = tokenizer.decode(outputs[0], skip_special_tokens=True)
